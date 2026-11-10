@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from core.models import ModelAction, RepairResult, TestResult
-from core.ports import ChatClient, RepairToolsPort
+from core.ports import ChatClient, RepairToolsPort, TraceRecorder
 from core.prompts import case_request, system_instruction, tool_result_message
 
 DECISION_BUDGET = 8
@@ -35,9 +35,27 @@ class InvalidReply(ValueError):
 class RepairAgent:
     """Traffic controller that validates one action per decision and stops safely."""
 
-    def __init__(self, client: ChatClient, tools: RepairToolsPort) -> None:
+    def __init__(
+        self,
+        client: ChatClient,
+        tools: RepairToolsPort,
+        recorder: TraceRecorder | None = None,
+    ) -> None:
         self._client = client
         self._tools = tools
+        self._recorder = recorder
+
+    def _emit(self, trace: list[dict[str, Any]], entry: dict[str, Any]) -> None:
+        """Append one event to the stored trace and notify any live recorder.
+
+        The stored trace is unchanged; the optional recorder only observes, so
+        repair logic and outcomes stay identical whether or not one is present.
+        """
+
+        trace.append(entry)
+        if self._recorder is not None:
+            payload = {key: value for key, value in entry.items() if key != "event"}
+            self._recorder.record(entry["event"], payload)
 
     def run(self, case_name: str, relative_files: list[str] | None = None) -> RepairResult:
         """Run one bounded repair attempt and return a result in every outcome."""
@@ -47,7 +65,8 @@ class RepairAgent:
             {"role": "system", "content": system_instruction()},
             {"role": "user", "content": case_request(case_name, files)},
         ]
-        trace: list[dict[str, Any]] = [{"event": "repair_started", "case": case_name}]
+        trace: list[dict[str, Any]] = []
+        self._emit(trace, {"event": "repair_started", "case": case_name})
         seen_read = False
         seen_failing_test = False
         seen_edit = False
@@ -67,13 +86,14 @@ class RepairAgent:
             try:
                 action = parse_model_reply(raw)
             except InvalidReply as exc:
-                trace.append(
+                self._emit(
+                    trace,
                     {
                         "event": "model_response",
                         "valid": False,
                         "summary": None,
                         "error": str(exc),
-                    }
+                    },
                 )
                 return self._finish(
                     trace,
@@ -82,24 +102,26 @@ class RepairAgent:
                     last_test=last_test,
                 )
 
-            trace.append(
+            self._emit(
+                trace,
                 {
                     "event": "model_response",
                     "valid": True,
                     "tool": action.tool,
                     "summary": action.summary,
-                }
+                },
             )
             messages.append({"role": "assistant", "content": raw})
 
             if action.tool == "edit_file" and not (seen_read and seen_failing_test):
                 observation = POLICY_ERROR
-                trace.append(
+                self._emit(
+                    trace,
                     {
                         "event": "tool_result",
                         "tool": action.tool,
                         "observation": observation,
-                    }
+                    },
                 )
                 messages.append(
                     {"role": "user", "content": tool_result_message(observation)}
@@ -118,25 +140,27 @@ class RepairAgent:
                 )
             except Exception as exc:
                 observation = f"tool error: {exc}"
-                trace.append(
+                self._emit(
+                    trace,
                     {
                         "event": "tool_result",
                         "tool": action.tool,
                         "observation": observation,
-                    }
+                    },
                 )
                 messages.append(
                     {"role": "user", "content": tool_result_message(observation)}
                 )
                 continue
 
-            trace.append(
+            self._emit(
+                trace,
                 {
                     "event": "tool_result",
                     "tool": action.tool,
                     "observation": observation,
                     "summary": action.summary,
-                }
+                },
             )
             messages.append({"role": "user", "content": tool_result_message(observation)})
 
@@ -197,7 +221,7 @@ class RepairAgent:
         reason: str,
         last_test: TestResult | None,
     ) -> RepairResult:
-        trace.append({"event": "repair_finished", "passed": passed, "reason": reason})
+        self._emit(trace, {"event": "repair_finished", "passed": passed, "reason": reason})
         workspace = getattr(self._tools, "workspace", None)
         changed_files = list(getattr(self._tools, "changed_files", []))
         return RepairResult(
