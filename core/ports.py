@@ -36,3 +36,14 @@ class TraceRecorder(Protocol):
 
     def record(self, event: str, payload: dict[str, Any]) -> None:
         """Record one public event without changing the repair outcome."""
+
+
+class ResearchPort(Protocol):
+    """Optional, bounded external evidence source, separate from file tools.
+
+    This is deliberately not part of ``RepairToolsPort``: research is optional
+    read-only evidence, never a sandbox file or test capability.
+    """
+
+    def search_github(self, query: str) -> dict[str, Any]:
+        """Return a small, JSON-compatible evidence record for one query."""

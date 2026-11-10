@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from adapters.models.scripted import ScriptedClient
 from adapters.sandbox.repair_tools import RepairTools
@@ -21,6 +22,22 @@ from core.repair_service import RepairService
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _EVALS_ROOT = _PROJECT_ROOT / "evals"
+
+
+class _FanOutRecorder:
+    """Forward each event to several recorders, each best-effort in isolation."""
+
+    def __init__(self, recorders: list[TraceRecorder]) -> None:
+        self._recorders = [r for r in recorders if r is not None]
+
+    def record(self, event: str, payload: dict[str, Any]) -> None:
+        """Deliver one event to every recorder; one failure never blocks another."""
+
+        for recorder in self._recorders:
+            try:
+                recorder.record(event, payload)
+            except Exception:
+                pass
 
 
 # --- Corrected source files, one single-bug fix per case --------------------
@@ -119,12 +136,49 @@ def build_service(
     model: str | None = None,
     temperature: float = 0.0,
     recorder: TraceRecorder | None = None,
+    research: bool = False,
+    observe: bool = False,
 ) -> RepairService:
     """Assemble a RepairService for the chosen model provider.
 
     An optional ``recorder`` is passed to each RepairAgent so a terminal can
-    display live events. It only observes; repair logic stays unchanged.
+    display live events. It only observes; repair logic stays unchanged. When
+    ``research`` is true, a fresh GitHub research adapter (with its own per
+    -repair budget) is constructed and injected; otherwise it is never built.
+    When ``observe`` is true, each repair also fans out to a fresh Langfuse
+    trajectory recorder; the required Langfuse env vars are validated here,
+    before any repair starts.
     """
+
+    if observe:
+        from adapters.observability.langfuse import missing_langfuse_env
+
+        missing = missing_langfuse_env()
+        if missing:
+            raise ValueError(
+                "observability (--observe) requires these environment "
+                f"variables: {', '.join(missing)}"
+            )
+
+    def _new_research():
+        """Construct a per-repair research adapter only when opted in."""
+
+        if not research:
+            return None
+        from adapters.research.github_research import GitHubResearch
+
+        # Token is read from the environment here, at composition time.
+        return GitHubResearch()
+
+    def _compose_recorder() -> TraceRecorder | None:
+        """Combine the terminal recorder with a per-repair Langfuse recorder."""
+
+        if not observe:
+            return recorder
+        from adapters.observability.langfuse import LangfuseTrajectoryRecorder
+
+        langfuse = LangfuseTrajectoryRecorder()
+        return _FanOutRecorder([recorder, langfuse])
 
     if provider == "scripted":
         def make_agent(case_name: str, workspace: Path) -> RepairAgent:
@@ -139,7 +193,9 @@ def build_service(
 
             client = ScriptedClient(sequence)
             tools = RepairTools(workspace, runner=docker_run_tests)
-            return RepairAgent(client, tools, recorder=recorder)
+            return RepairAgent(
+                client, tools, recorder=_compose_recorder(), research=_new_research()
+            )
     elif provider == "ollama":
         def make_agent(case_name: str, workspace: Path) -> RepairAgent:
             """Build runner-backed tools and a live Ollama agent for one copy."""
@@ -149,7 +205,9 @@ def build_service(
 
             client = OllamaClient(model=model, temperature=temperature)
             tools = RepairTools(workspace, runner=docker_run_tests)
-            return RepairAgent(client, tools, recorder=recorder)
+            return RepairAgent(
+                client, tools, recorder=_compose_recorder(), research=_new_research()
+            )
     else:
         raise ValueError(f"Unsupported provider: {provider!r}")
 

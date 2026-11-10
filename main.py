@@ -53,6 +53,16 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="Sampling temperature for a live provider (default: 0.0).",
     )
+    repair_parser.add_argument(
+        "--research",
+        action="store_true",
+        help="Enable optional, bounded GitHub code-search evidence (opt-in).",
+    )
+    repair_parser.add_argument(
+        "--observe",
+        action="store_true",
+        help="Record a small public trajectory to Langfuse Cloud (opt-in).",
+    )
 
     subparsers.add_parser(
         "ui", help="Launch the local Gradio page for scripted repairs."
@@ -73,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             temperature=args.temperature,
             recorder=recorder,
+            research=args.research,
+            observe=args.observe,
         )
         result = service.repair(args.project)
     except ValueError as exc:

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 
-def system_instruction() -> str:
-    """Tell the model the evidence order and the one-JSON-object reply format."""
+def system_instruction(research_enabled: bool = False) -> str:
+    """Tell the model the evidence order and the one-JSON-object reply format.
 
-    return (
+    When ``research_enabled`` is true, one extra action is offered. Research is
+    optional evidence that must come after a local read and a failing test; it
+    is never an authority and never a substitute for a passing sandboxed test.
+    """
+
+    base = (
         "You repair one local Python project. Follow this evidence order: "
         "inspect local code, reproduce a failing test before editing, make a "
         "focused edit, then verify the repair with tests.\n"
@@ -18,6 +23,16 @@ def system_instruction() -> str:
         '{"tool":"read_file","path":"test_calculator.py","summary":"Read the test"}\n'
         '{"tool":"run_tests","summary":"Reproduce the failure"}\n'
         '{"tool":"edit_file","path":"calculator.py","content":"..."}'
+    )
+    if not research_enabled:
+        return base
+    return (
+        base
+        + "\n"
+        '{"tool":"search_github","query":"Python median even length","summary":"Find a public reference"}\n'
+        "search_github is optional evidence, not an authority. It is allowed "
+        "only after a successful read_file and a failing run_tests, and it "
+        "never proves a fix: only a later passing sandboxed test can."
     )
 
 

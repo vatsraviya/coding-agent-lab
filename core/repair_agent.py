@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from core.models import ModelAction, RepairResult, TestResult
-from core.ports import ChatClient, RepairToolsPort, TraceRecorder
+from core.ports import ChatClient, RepairToolsPort, ResearchPort, TraceRecorder
 from core.prompts import case_request, system_instruction, tool_result_message
 
 DECISION_BUDGET = 8
 POLICY_ERROR = (
     "policy-error: an edit is not allowed until this repair has one successful "
+    "read_file observation and one failing run_tests observation."
+)
+SEARCH_POLICY_ERROR = (
+    "policy-error: a search is not allowed until this repair has one successful "
     "read_file observation and one failing run_tests observation."
 )
 
@@ -26,6 +30,9 @@ _REQUIRED_FIELDS = {
     "run_tests": frozenset({"tool"}),
     "edit_file": frozenset({"tool", "path", "content"}),
 }
+# Offered only when research is enabled; never weakens the base actions above.
+_RESEARCH_ALLOWED = {"search_github": frozenset({"tool", "query", "summary"})}
+_RESEARCH_REQUIRED = {"search_github": frozenset({"tool", "query"})}
 
 
 class InvalidReply(ValueError):
@@ -40,10 +47,12 @@ class RepairAgent:
         client: ChatClient,
         tools: RepairToolsPort,
         recorder: TraceRecorder | None = None,
+        research: ResearchPort | None = None,
     ) -> None:
         self._client = client
         self._tools = tools
         self._recorder = recorder
+        self._research = research
 
     def _emit(self, trace: list[dict[str, Any]], entry: dict[str, Any]) -> None:
         """Append one event to the stored trace and notify any live recorder.
@@ -55,14 +64,20 @@ class RepairAgent:
         trace.append(entry)
         if self._recorder is not None:
             payload = {key: value for key, value in entry.items() if key != "event"}
-            self._recorder.record(entry["event"], payload)
+            try:
+                self._recorder.record(entry["event"], payload)
+            except Exception:
+                # A recorder is an observer only: a failed recording must never
+                # change the repair result or stop the repair.
+                pass
 
     def run(self, case_name: str, relative_files: list[str] | None = None) -> RepairResult:
         """Run one bounded repair attempt and return a result in every outcome."""
 
         files = list(relative_files or [])
+        research_enabled = self._research is not None
         messages = [
-            {"role": "system", "content": system_instruction()},
+            {"role": "system", "content": system_instruction(research_enabled)},
             {"role": "user", "content": case_request(case_name, files)},
         ]
         trace: list[dict[str, Any]] = []
@@ -84,7 +99,7 @@ class RepairAgent:
                 )
 
             try:
-                action = parse_model_reply(raw)
+                action = parse_model_reply(raw, allow_research=research_enabled)
             except InvalidReply as exc:
                 self._emit(
                     trace,
@@ -113,8 +128,11 @@ class RepairAgent:
             )
             messages.append({"role": "assistant", "content": raw})
 
-            if action.tool == "edit_file" and not (seen_read and seen_failing_test):
-                observation = POLICY_ERROR
+            gated = action.tool in ("edit_file", "search_github")
+            if gated and not (seen_read and seen_failing_test):
+                observation = (
+                    POLICY_ERROR if action.tool == "edit_file" else SEARCH_POLICY_ERROR
+                )
                 self._emit(
                     trace,
                     {
@@ -199,6 +217,13 @@ class RepairAgent:
         if action.tool == "read_file":
             content = self._tools.read_file(str(action.arguments["path"]))
             return content, last_test, True, seen_failing_test, seen_edit
+        if action.tool == "search_github":
+            if self._research is None:
+                raise RuntimeError("research is not enabled for this repair")
+            record = self._research.search_github(str(action.arguments["query"]))
+            # Return the full citable record so provenance stays visible.
+            observation = json.dumps(record)
+            return observation, last_test, seen_read, seen_failing_test, seen_edit
         if action.tool == "run_tests":
             result = self._tools.run_tests()
             observation = (
@@ -233,8 +258,18 @@ class RepairAgent:
         )
 
 
-def parse_model_reply(raw: str) -> ModelAction:
-    """Parse a raw model reply as exactly one permitted JSON action object."""
+def parse_model_reply(raw: str, allow_research: bool = False) -> ModelAction:
+    """Parse a raw model reply as exactly one permitted JSON action object.
+
+    ``search_github`` is accepted only when ``allow_research`` is true; the base
+    three actions and all other validation stay exactly as strict either way.
+    """
+
+    allowed = _ALLOWED_FIELDS
+    required = _REQUIRED_FIELDS
+    if allow_research:
+        allowed = {**_ALLOWED_FIELDS, **_RESEARCH_ALLOWED}
+        required = {**_REQUIRED_FIELDS, **_RESEARCH_REQUIRED}
 
     text = raw.strip()
     if not text:
@@ -249,13 +284,13 @@ def parse_model_reply(raw: str) -> ModelAction:
         raise InvalidReply("reply must be a single JSON object")
 
     tool = parsed.get("tool")
-    if tool not in _ALLOWED_FIELDS:
+    if tool not in allowed:
         raise InvalidReply(f"unknown tool: {tool!r}")
     keys = frozenset(parsed)
-    missing = _REQUIRED_FIELDS[tool] - keys
+    missing = required[tool] - keys
     if missing:
         raise InvalidReply(f"missing fields for {tool}: {sorted(missing)}")
-    extra = keys - _ALLOWED_FIELDS[tool]
+    extra = keys - allowed[tool]
     if extra:
         raise InvalidReply(f"fields not allowed for {tool}: {sorted(extra)}")
 
@@ -263,6 +298,8 @@ def parse_model_reply(raw: str) -> ModelAction:
         raise InvalidReply("path must be a string")
     if "content" in parsed and not isinstance(parsed["content"], str):
         raise InvalidReply("content must be a string")
+    if "query" in parsed and not isinstance(parsed["query"], str):
+        raise InvalidReply("query must be a string")
     summary = parsed.get("summary")
     if summary is not None and not isinstance(summary, str):
         raise InvalidReply("summary must be a string")
